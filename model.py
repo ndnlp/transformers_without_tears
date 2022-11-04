@@ -4,7 +4,6 @@ from torch.nn import Parameter
 import torch.nn.functional as F
 
 from layers import Encoder, Decoder
-import utils as ut
 import all_constants as ac
 
 
@@ -50,6 +49,18 @@ class Transformer(nn.Module):
         if use_bias:
             nn.init.constant_(self.out_bias, 0.)
 
+    def get_positional_encoding(self, dim, sentence_length):
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+        div_term = -(torch.arange(end=float(dim), device=device) // 2) * 2.0 / dim
+        div_term = torch.pow(10000.0, div_term).reshape(1, -1)
+        pos = torch.arange(end=float(sentence_length), device=device).reshape(-1, 1)
+        encoded_vec = torch.matmul(pos, div_term)
+        encoded_vec[:, 0::2] = torch.sin(encoded_vec[:, 0::2])
+        encoded_vec[:, 1::2] = torch.cos(encoded_vec[:, 1::2])
+
+        return encoded_vec.reshape([sentence_length, dim])
+
     def replace_with_unk(self, toks):
         # word-dropout
         p = self.args.word_dropout
@@ -71,7 +82,7 @@ class Transformer(nn.Module):
     def forward(self, src, tgt, targets, src_lang_idx, tgt_lang_idx, logit_mask):
         embed_dim = self.args.embed_dim
         max_len = max(src.size(1), tgt.size(1))
-        pos_embedding = ut.get_positional_encoding(embed_dim, max_len)
+        pos_embedding = self.get_positional_encoding(embed_dim, max_len)
         word_embedding = F.normalize(self.word_embedding, dim=-1) if self.args.fix_norm else self.word_embedding
 
         encoder_inputs = self.get_input(src, src_lang_idx, word_embedding, pos_embedding)
@@ -120,7 +131,7 @@ class Transformer(nn.Module):
         embed_dim = self.args.embed_dim
         max_len = src.size(1) + self.args.rel_max_len + 1 if self.args.use_rel_max_len else self.args.abs_max_len + 1
         max_len = max(max_len, src.size(1))
-        pos_embedding = ut.get_positional_encoding(embed_dim, max_len)
+        pos_embedding = self.get_positional_encoding(embed_dim, max_len)
         word_embedding = F.normalize(self.word_embedding, dim=-1) if self.args.fix_norm else self.word_embedding
         logit_mask = logit_mask == 1 if self.logit_mask is None else self.logit_mask
         tgt_lang_embed = self.lang_embedding[tgt_lang_idx]

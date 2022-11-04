@@ -1,5 +1,6 @@
 import re
 import logging
+from datetime import timedelta
 import os
 from os.path import join, exists, basename
 from subprocess import Popen, PIPE
@@ -148,6 +149,9 @@ class IO(object):
 
         self.logger = logger
         return logger
+
+    def format_seconds(self, seconds):
+        return str(timedelta(seconds=seconds))
 
     def _init_vocab(self, vocab_file):
         vocab = {}
