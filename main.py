@@ -9,7 +9,6 @@ from model import Transformer
 from io_and_bleu import IO
 
 import all_constants as ac
-import utils as ut
 import configurations
 
 def get_parser():

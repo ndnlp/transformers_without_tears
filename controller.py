@@ -2,7 +2,6 @@ import time
 import numpy as np
 import torch
 import all_constants as ac
-import utils as ut
 
 
 class Controller(object):
@@ -322,7 +321,7 @@ class Controller(object):
         self.io.save_score(ac.DEV_BLEU, avg_bleu)
         self.stats['avg_bleus'].append(avg_bleu)
         self.logger.info(f'avg_bleu = {avg_bleu}')
-        self.logger.info(f'Done evaluating dev BLEU, it takes {ut.format_seconds(time.time() - start)} seconds')
+        self.logger.info(f'Done evaluating dev BLEU, it takes {self.io.format_seconds(time.time() - start)} seconds')
 
     def get_trans(self, probs, scores, symbols):
         def ids_to_trans(trans_ids):
