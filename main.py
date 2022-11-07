@@ -6,6 +6,7 @@ import torch
 from controller import Controller
 from data_manager import DataManager
 from model import Transformer
+from generator import Generator
 from io_and_bleu import IO
 
 import all_constants as ac
@@ -93,9 +94,10 @@ if __name__ == '__main__':
     param_count = sum([np.prod(p.size()) for p in model.parameters()])
     logger.info(f'Model has {param_count:,} parameters')
 
-    # initialize controller
+    # initialize other modules
+    generator = Generator(args, model)
     data_manager = DataManager(args, io)
-    controller = Controller(args, model, data_manager, io)
+    controller = Controller(args, model, generator, data_manager, io)
 
     # train
     if args.mode == 'train' or args.mode == 'train_and_translate':

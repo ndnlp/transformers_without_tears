@@ -79,6 +79,12 @@ class Transformer(nn.Module):
 
         return word_embed + lang_embed + pos_embed
 
+    def logit_fn(self, decoder_output, softmax_weight, logit_mask):
+        logits = F.linear(decoder_output, softmax_weight, bias=self.out_bias)
+        logits = logits.reshape(-1, logits.size(-1))
+        logits[:, ~logit_mask] = -1e9
+        return logits
+
     def forward(self, src, tgt, targets, src_lang_idx, tgt_lang_idx, logit_mask):
         embed_dim = self.args.embed_dim
         max_len = max(src.size(1), tgt.size(1))
@@ -121,37 +127,30 @@ class Transformer(nn.Module):
             'num_words': num_words
         }
 
-    def logit_fn(self, decoder_output, softmax_weight, logit_mask):
-        logits = F.linear(decoder_output, softmax_weight, bias=self.out_bias)
-        logits = logits.reshape(-1, logits.size(-1))
-        logits[:, ~logit_mask] = -1e9
-        return logits
-
-    def beam_decode(self, src, src_lang_idx, tgt_lang_idx, logit_mask, beam_size):
+    def get_decoder_one_step_fn(self, src, src_lang_idx, tgt_lang_idx, logit_mask, max_len):
         embed_dim = self.args.embed_dim
-        max_len = src.size(1) + self.args.rel_max_len + 1 if self.args.use_rel_max_len else self.args.abs_max_len + 1
-        max_len = max(max_len, src.size(1))
         pos_embedding = self.get_positional_encoding(embed_dim, max_len)
         word_embedding = F.normalize(self.word_embedding, dim=-1) if self.args.fix_norm else self.word_embedding
-        logit_mask = logit_mask == 1 if self.logit_mask is None else self.logit_mask
-        tgt_lang_embed = self.lang_embedding[tgt_lang_idx]
 
         encoder_inputs = self.get_input(src, src_lang_idx, word_embedding, pos_embedding)
         encoder_mask = (src == ac.PAD_ID).unsqueeze(1).unsqueeze(2)
         encoder_outputs = self.encoder(encoder_inputs, encoder_mask)
 
-        def get_tgt_inp(tgt, time_step):
+        tgt_lang_embed = self.lang_embedding[tgt_lang_idx]
+        logit_mask = logit_mask == 1 if self.logit_mask is None else self.logit_mask
+        
+        # tgt: [bsz, beam]
+        def run_decoder_for_one_step(tgt, time_step, cache):
             word_embed = F.embedding(tgt.type(src.type()), word_embedding) * self.scale
             pos_embed = pos_embedding[time_step, :].reshape(1, 1, -1)
-            return word_embed + tgt_lang_embed + pos_embed
+            decoder_inputs = word_embed + tgt_lang_embed + pos_embed # [bsz, beam, D]
+            bsz = decoder_inputs.shape[0]
+            beam = decoder_inputs.shape[1]
+            decoder_inputs = decoder_inputs.reshape(bsz * beam, -1).unsqueeze_(1) # [bsz x beam, 1, D]
 
-        def logprob_fn(decoder_output):
-            logits = self.logit_fn(decoder_output, word_embedding, logit_mask)
+            y = self.decoder.beam_step(decoder_inputs, cache).squeeze_(1) # [bsz x beam, D]
+            
+            logits = self.logit_fn(y, word_embedding, logit_mask) # [bsz x beam, V]
             return F.log_softmax(logits, dim=-1)
 
-        if self.args.use_rel_max_len:
-            max_lengths = torch.sum(src != ac.PAD_ID, dim=-1).type(src.type()) + self.args.rel_max_len
-        else:
-            max_lengths = torch.tensor([self.args.abs_max_len] * src.size(0)).type(src.type())
-
-        return self.decoder.beam_decode(encoder_outputs, encoder_mask, get_tgt_inp, logprob_fn, ac.BOS_ID, ac.EOS_ID, max_lengths, beam_size=beam_size, alpha=self.args.beam_alpha, decode_method=self.args.decode_method, allow_empty=self.args.allow_empty)
+        return run_decoder_for_one_step, encoder_mask, encoder_outputs
