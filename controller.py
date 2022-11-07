@@ -5,10 +5,11 @@ import all_constants as ac
 
 
 class Controller(object):
-    def __init__(self, args, model, data_manager, io):
+    def __init__(self, args, model, generator, data_manager, io):
         super(Controller, self).__init__()
         self.args = args
         self.model = model
+        self.generator = generator
         self.data_manager = data_manager
         self.io = io
         self.logger = args.logger
@@ -408,7 +409,7 @@ class Controller(object):
                 for src in new_batches:
                     src_cuda = src.to(self.device)
                     logit_mask = logit_mask.to(self.device)
-                    ret = self.model.beam_decode(src_cuda, src_lang_idx, tgt_lang_idx, logit_mask, beam_size)
+                    ret = self.generator.generate(src_cuda, src_lang_idx, tgt_lang_idx, logit_mask, beam_size)
                     for x in ret:
                         probs = x['probs'].cpu().detach().numpy().reshape([-1])
                         scores = x['scores'].cpu().detach().numpy().reshape([-1])
