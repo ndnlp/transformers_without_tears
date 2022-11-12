@@ -240,18 +240,6 @@ class Decoder(nn.Module):
         return x
 
     def beam_step(self, inp, cache):
-        bsz, beam_size = cache['encoder_mask'].size()[:2]
-        cache['encoder_mask'] = cache['encoder_mask'].reshape(bsz * beam_size, 1, 1, -1)
-        for i in range(self.num_layers):
-            seq_len = cache[i]['cross_att_k'].size(2)
-            cache[i]['cross_att_k'] = cache[i]['cross_att_k'].reshape(bsz * beam_size, seq_len, -1)
-            cache[i]['cross_att_v'] = cache[i]['cross_att_v'].reshape(bsz * beam_size, seq_len, -1)
-
-            if cache[i]['att']['k'] is not None:
-                seq_len = cache[i]['att']['k'].size(2)
-                cache[i]['att']['k'] = cache[i]['att']['k'].reshape(bsz * beam_size, seq_len, -1)
-                cache[i]['att']['v'] = cache[i]['att']['v'].reshape(bsz * beam_size, seq_len, -1)
-
         pre_act = self.pre_act
         post_act = not pre_act
 
@@ -267,12 +255,7 @@ class Decoder(nn.Module):
             residual = x
             x = att_scale(x) if pre_act else x
             q, k, v = att.proj_qkv(x, x, x)
-            if cache[i]['att']['k'] is not None:
-                k = torch.cat((cache[i]['att']['k'], k), 1)
-                v = torch.cat((cache[i]['att']['v'], v), 1)
-
-            cache[i]['att']['k'] = k
-            cache[i]['att']['v'] = v
+            k, v = cache.update_att(i, k, v)
 
             x, _ = att(q=q, k=k, v=v, mask=None, do_proj_qkv=False)
             x = residual + x
@@ -281,9 +264,7 @@ class Decoder(nn.Module):
             residual = x
             x = cross_att_scale(x) if pre_act else x
             q = cross_att.proj_q(x)
-            k = cache[i]['cross_att_k']
-            v = cache[i]['cross_att_v']
-            mask = cache['encoder_mask']
+            k, v, mask = cache.retrieve_cross_att(i)
             x, _ = cross_att(q=q, k=k, v=v, mask=mask, do_proj_qkv=False)
             x = residual + x
             x = cross_att_scale(x) if post_act else x
@@ -296,14 +277,118 @@ class Decoder(nn.Module):
 
         x = self.scales[-1](x) if pre_act else x
 
-        cache['encoder_mask'] = cache['encoder_mask'].reshape(bsz, beam_size, 1, 1, -1)
-        for i in range(self.num_layers):
-            seq_len = cache[i]['cross_att_k'].size(1)
-            cache[i]['cross_att_k'] = cache[i]['cross_att_k'].reshape(bsz, beam_size, seq_len, -1)
-            cache[i]['cross_att_v'] = cache[i]['cross_att_v'].reshape(bsz, beam_size, seq_len, -1)
-
-            seq_len = cache[i]['att']['k'].size(1)
-            cache[i]['att']['k'] = cache[i]['att']['k'].reshape(bsz, beam_size, seq_len, -1)
-            cache[i]['att']['v'] = cache[i]['att']['v'].reshape(bsz, beam_size, seq_len, -1)
-
         return x
+
+    # Cache switches back between two different shapes:
+    #   [batch_size * beam_size, ....]
+    #   [batch_size, beam_size, ....]
+    # The cache maintains the correct shape by itself; the user should not need to think about this.
+    class Cache():
+        """Cache for storing intermediate decoder results"""
+        # Creates cache in [batch_size, beam_size, ....] format
+        def __init__(self, encoder_mask, encoder_out, decoder):
+            self.decoder = decoder
+            self.num_layers = decoder.num_layers
+
+            self.in_batch_comma_beam_format = True
+            self.batch_size = encoder_mask.size(0)
+            self.beam_size = 1
+
+            self.cache = {'encoder_mask': encoder_mask.unsqueeze_(1)}
+            for i in range(self.num_layers):
+                self.cache[i] = {'att': {'k': None, 'v': None}}
+                self.cache[i]['cross_att_k'] = self.decoder.cross_atts[i].proj_k(encoder_out).unsqueeze_(1)
+                self.cache[i]['cross_att_v'] = self.decoder.cross_atts[i].proj_v(encoder_out).unsqueeze_(1)
+
+        # Switch format from [batch_size, beam_size, ....] to [batch_size * beam_size, ....]
+        def batch_times_beam(self):
+            self.in_batch_comma_beam_format = False
+            batch_size = self.batch_size
+            beam_size = self.beam_size
+
+            self.cache['encoder_mask'] = self.cache['encoder_mask'].reshape(batch_size * beam_size, 1, 1, -1)
+            for i in range(self.num_layers):
+                seq_len = self.cache[i]['cross_att_k'].size(2)
+                self.cache[i]['cross_att_k'] = self.cache[i]['cross_att_k'].reshape(batch_size * beam_size, seq_len, -1)
+                self.cache[i]['cross_att_v'] = self.cache[i]['cross_att_v'].reshape(batch_size * beam_size, seq_len, -1)
+
+                if self.cache[i]['att']['k'] is not None:
+                    seq_len = self.cache[i]['att']['k'].size(2)
+                    self.cache[i]['att']['k'] = self.cache[i]['att']['k'].reshape(batch_size * beam_size, seq_len, -1)
+                    self.cache[i]['att']['v'] = self.cache[i]['att']['v'].reshape(batch_size * beam_size, seq_len, -1)
+
+        # Switch format from [batch_size * beam_size, ....] to [batch_size, beam_size, ....]
+        def batch_comma_beam(self):
+            self.in_batch_comma_beam_format = True
+            batch_size = self.batch_size
+            beam_size = self.beam_size
+
+            self.cache['encoder_mask'] = self.cache['encoder_mask'].reshape(batch_size, beam_size, 1, 1, -1)
+            for i in range(self.num_layers):
+                seq_len = self.cache[i]['cross_att_k'].size(1)
+                self.cache[i]['cross_att_k'] = self.cache[i]['cross_att_k'].reshape(batch_size, beam_size, seq_len, -1)
+                self.cache[i]['cross_att_v'] = self.cache[i]['cross_att_v'].reshape(batch_size, beam_size, seq_len, -1)
+
+                seq_len = self.cache[i]['att']['k'].size(1)
+                self.cache[i]['att']['k'] = self.cache[i]['att']['k'].reshape(batch_size, beam_size, seq_len, -1)
+                self.cache[i]['att']['v'] = self.cache[i]['att']['v'].reshape(batch_size, beam_size, seq_len, -1)
+
+        # Update self-attention + return result
+        def update_att(self, i, k, v):
+            if self.in_batch_comma_beam_format:
+                self.batch_times_beam()
+
+            if self.cache[i]['att']['k'] is not None:
+                k = torch.cat((self.cache[i]['att']['k'], k), 1)
+                v = torch.cat((self.cache[i]['att']['v'], v), 1)
+
+            self.cache[i]['att']['k'] = k
+            self.cache[i]['att']['v'] = v
+            
+            return k, v
+
+        # Retrieve cached cross-attention
+        def retrieve_cross_att(self, i):
+            if self.in_batch_comma_beam_format:
+                self.batch_times_beam()
+
+            k = self.cache[i]['cross_att_k']
+            v = self.cache[i]['cross_att_v']
+            mask = self.cache['encoder_mask']
+            return k, v, mask
+
+        # Expand beam size from 1 to beam_size
+        def expand_to_beam_size(self, beam_size):
+            if not self.in_batch_comma_beam_format:
+                self.batch_comma_beam()
+            self.cache['encoder_mask'] = self.cache['encoder_mask'].expand(-1, beam_size, -1, -1, -1)
+            for i in range(self.num_layers):
+                self.cache[i]['att']['k'] = self.cache[i]['att']['k'].expand(-1, beam_size, -1, -1)
+                self.cache[i]['att']['v'] = self.cache[i]['att']['v'].expand(-1, beam_size, -1, -1)
+                self.cache[i]['cross_att_k'] = self.cache[i]['cross_att_k'].expand(-1, beam_size, -1, -1)
+                self.cache[i]['cross_att_v'] = self.cache[i]['cross_att_v'].expand(-1, beam_size, -1, -1)
+            self.beam_size = beam_size
+
+        # Remove sentences from the cache
+        def trim_finished_sents(self, finished_sents):
+            if not self.in_batch_comma_beam_format:
+                self.batch_comma_beam()
+            self.cache['encoder_mask'] = self.cache['encoder_mask'][~finished_sents]
+            for i in range(self.num_layers):
+                self.cache[i]['att']['k'] = self.cache[i]['att']['k'][~finished_sents]
+                self.cache[i]['att']['v'] = self.cache[i]['att']['v'][~finished_sents]
+                self.cache[i]['cross_att_k'] = self.cache[i]['cross_att_k'][~finished_sents]
+                self.cache[i]['cross_att_v'] = self.cache[i]['cross_att_v'][~finished_sents]
+            self.batch_size = self.cache['encoder_mask'].size(0)
+
+        # This is used for topk selection during beam search
+        def keep_beams(self, parent_idxs):
+            if not self.in_batch_comma_beam_format:
+                self.batch_comma_beam()
+            batch_size = self.batch_size
+            beam_size = self.beam_size
+
+            for i in range(self.num_layers):
+                seq_len = self.cache[i]['att']['k'].size(2)
+                self.cache[i]['att']['k'] = self.cache[i]['att']['k'].reshape(batch_size * beam_size, seq_len, -1)[parent_idxs].reshape(batch_size, beam_size, seq_len, -1)
+                self.cache[i]['att']['v'] = self.cache[i]['att']['v'].reshape(batch_size * beam_size, seq_len, -1)[parent_idxs].reshape(batch_size, beam_size, seq_len, -1)

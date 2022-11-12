@@ -19,7 +19,11 @@ class Generator():
     
     #def cluster_search_beam(self):
     
+    # src: [batch_size, length]
+    # logit_mask: ???
+    # src_lang_idx, tgt_lang_idx, beam_size: int
     def generate(self, src, src_lang_idx, tgt_lang_idx, logit_mask, beam_size):
+
         if self.args.use_rel_max_len:
             max_possible_length = src.size(1) + self.args.rel_max_len + 1
             max_lengths = torch.sum(src != ac.PAD_ID, dim=-1).type(src.type()) + self.args.rel_max_len
@@ -27,7 +31,7 @@ class Generator():
             max_possible_length = max(self.args.abs_max_len + 1, src.size(1))  
             max_lengths = torch.tensor([self.args.abs_max_len] * src.size(0)).type(src.type())
             
-        decoder_one_step_fn, encoder_mask, encoder_out = self.model.get_decoder_one_step_fn(src, src_lang_idx, tgt_lang_idx, logit_mask, max_possible_length)
+        decoder_one_step_fn, cache = self.model.get_decoder_one_step_fn(src, src_lang_idx, tgt_lang_idx, logit_mask, max_possible_length)
         
         bos_id = ac.BOS_ID
         eos_id = ac.EOS_ID
@@ -35,19 +39,11 @@ class Generator():
         decode_method = self.args.decode_method
         allow_empty = self.args.allow_empty
         
-        num_layers = self.args.num_dec_layers
-        
         # below this point is stuff I copied from the old beam_decode function in layers.py
         # with very small modifications
 
         # first step, beam=1
         batch_size = src.size(0)
-        cache = {'encoder_mask': encoder_mask.unsqueeze_(1)} # [bsz, beam, 1, 1, length]
-        for i in range(num_layers):
-            cache[i] = {'att': {'k': None, 'v': None}}
-            cache[i]['cross_att_k'] = self.model.decoder.cross_atts[i].proj_k(encoder_out).unsqueeze_(1)
-            cache[i]['cross_att_v'] = self.model.decoder.cross_atts[i].proj_v(encoder_out).unsqueeze_(1)
-
         tgt = torch.tensor([bos_id] * batch_size).reshape(batch_size, 1) # [bsz, 1]
         next_token_probs = decoder_one_step_fn(tgt, 0, cache) # [bsz, V]
         
@@ -64,15 +60,11 @@ class Generator():
         cumulative_scores = cumulative_probs.clone()
         cumulative_symbols = chosen_symbols.reshape(batch_size, beam_size, 1)
 
-        cache['encoder_mask'] = encoder_mask.expand(-1, beam_size, -1, -1, -1)
-        for i in range(num_layers):
-            cache[i]['att']['k'] = cache[i]['att']['k'].expand(-1, beam_size, -1, -1)
-            cache[i]['att']['v'] = cache[i]['att']['v'].expand(-1, beam_size, -1, -1)
-            cache[i]['cross_att_k'] = cache[i]['cross_att_k'].expand(-1, beam_size, -1, -1)
-            cache[i]['cross_att_v'] = cache[i]['cross_att_v'].expand(-1, beam_size, -1, -1)
+        cache.expand_to_beam_size(beam_size)
 
         num_classes = next_token_probs.size(-1)
-        not_eos_mask = (torch.arange(num_classes).reshape(1, -1) != eos_id).type(encoder_mask.type())
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        not_eos_mask = (torch.arange(num_classes, device=device).reshape(1, -1) != eos_id)
         maximum_length = max_lengths.max().item()
         ret = [None] * batch_size
         batch_idxs = torch.arange(batch_size)
@@ -95,12 +87,7 @@ class Generator():
                 cumulative_scores = cumulative_scores[~finished_sents]
                 max_lengths = max_lengths[~finished_sents]
                 batch_idxs = batch_idxs[~finished_sents]
-                cache['encoder_mask'] = cache['encoder_mask'][~finished_sents]
-                for i in range(num_layers):
-                    cache[i]['att']['k'] = cache[i]['att']['k'][~finished_sents]
-                    cache[i]['att']['v'] = cache[i]['att']['v'][~finished_sents]
-                    cache[i]['cross_att_k'] = cache[i]['cross_att_k'][~finished_sents]
-                    cache[i]['cross_att_v'] = cache[i]['cross_att_v'][~finished_sents]
+                cache.trim_finished_sents(finished_sents)
 
             if finished_sents.all():
                 break
@@ -144,11 +131,8 @@ class Generator():
                 parent_idxs = parent_idxs.reshape(-1)
                 cumulative_symbols = cumulative_symbols.reshape(bsz * beam_size, -1)[parent_idxs].reshape(bsz, beam_size, -1)
                 cumulative_symbols = torch.cat((cumulative_symbols, symbols.unsqueeze_(-1)), -1)
+                cache.keep_beams(parent_idxs)
 
-                for i in range(num_layers):
-                    seq_len = cache[i]['att']['k'].size(2)
-                    cache[i]['att']['k'] = cache[i]['att']['k'].reshape(bsz * beam_size, seq_len, -1)[parent_idxs].reshape(bsz, beam_size, seq_len, -1)
-                    cache[i]['att']['v'] = cache[i]['att']['v'].reshape(bsz * beam_size, seq_len, -1)[parent_idxs].reshape(bsz, beam_size, seq_len, -1)
             # sampling
             else:
                 # (currently, probs and scores are always the same during sampling)

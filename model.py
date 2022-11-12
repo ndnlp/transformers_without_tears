@@ -153,4 +153,6 @@ class Transformer(nn.Module):
             logits = self.logit_fn(y, word_embedding, logit_mask) # [bsz x beam, V]
             return F.log_softmax(logits, dim=-1)
 
-        return run_decoder_for_one_step, encoder_mask, encoder_outputs
+        cache = Decoder.Cache(encoder_mask, encoder_outputs, self.decoder)
+
+        return run_decoder_for_one_step, cache
