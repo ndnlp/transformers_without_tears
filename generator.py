@@ -25,11 +25,10 @@ class Generator():
     def generate(self, src, src_lang_idx, tgt_lang_idx, logit_mask, beam_size):
 
         if self.args.use_rel_max_len:
-            max_possible_length = src.size(1) + self.args.rel_max_len + 1
             max_lengths = torch.sum(src != ac.PAD_ID, dim=-1).type(src.type()) + self.args.rel_max_len
         else:
-            max_possible_length = max(self.args.abs_max_len + 1, src.size(1))  
             max_lengths = torch.tensor([self.args.abs_max_len] * src.size(0)).type(src.type())
+        max_possible_length = max_lengths.max().item()
             
         decoder_one_step_fn, cache = self.model.get_decoder_one_step_fn(src, src_lang_idx, tgt_lang_idx, logit_mask, max_possible_length)
         
@@ -65,12 +64,11 @@ class Generator():
         num_classes = next_token_probs.size(-1)
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         not_eos_mask = (torch.arange(num_classes, device=device).reshape(1, -1) != eos_id)
-        maximum_length = max_lengths.max().item()
         ret = [None] * batch_size
         batch_idxs = torch.arange(batch_size)
-        for time_step in range(1, maximum_length + 1):
+        for time_step in range(1, max_possible_length + 1):
             # once all the beams/samples for a sentence are finished, can stop doing computations on it
-            surpass_length = (max_lengths < time_step) + (time_step == maximum_length)
+            surpass_length = (max_lengths < time_step) + (time_step == max_possible_length)
             finished_decoded = torch.sum((cumulative_symbols[:, :, -1] == eos_id).type(max_lengths.type()), -1) == beam_size
             finished_sents = surpass_length + finished_decoded
             if finished_sents.any():
