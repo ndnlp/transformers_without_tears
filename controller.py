@@ -328,6 +328,8 @@ class Controller(object):
         def ids_to_trans(trans_ids):
             words = []
             for idx in trans_ids:
+                if idx == ac.BOS_ID:
+                    continue
                 if idx == ac.EOS_ID:
                     break
                 words.append(self.data_manager.ivocab[idx])

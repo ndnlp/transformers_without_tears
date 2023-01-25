@@ -1,5 +1,7 @@
 import torch
+from torch.nn.utils.rnn import pad_sequence
 import all_constants as ac
+
 
 class Generator():
     """
@@ -8,9 +10,71 @@ class Generator():
     def __init__(self, args, model):
         self.args = args
         self.model = model
-    
-    #def sample(self):
-    
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    def sample(self, src, max_lengths, max_possible_length, decoder_one_step_fn, cache, num_samples):
+        device=self.device
+        batch_size = src.size(0)
+        size = batch_size * num_samples
+        max_lengths = max_lengths.unsqueeze(1).expand(-1, num_samples).reshape(-1, 1).squeeze(dim=1)
+
+        cumulative_symbols = torch.tensor([ac.BOS_ID] * size, device=device).reshape(size, 1) # [bsz * num_samples, seq=1]
+        cumulative_probs = torch.zeros(size=(size, 1), device=device) # [bsz * num_samples, dummy dimension for V]
+        cache.expand_to_sample_size(num_samples)
+
+        ret_symbols = [None] * size
+        ret_probs = [None] * size
+        orig_idxs = torch.arange(size, device=device)
+
+        for time_step in range(0, max_possible_length + 1):
+            # when a sample is finished, can stop doing computation on it
+            if time_step > 0:
+                reached_max_length = (max_lengths < time_step) + (time_step == max_possible_length)
+                finished_decoding = (cumulative_symbols[:, -1] == ac.EOS_ID)
+                finished_sents = reached_max_length + finished_decoding
+
+                if finished_sents.any():
+                    for j in range(finished_sents.size(0)):
+                        if finished_sents[j]:
+                            ret_symbols[orig_idxs[j]] = cumulative_symbols[j].clone()
+                            ret_probs[orig_idxs[j]] = cumulative_probs[j].clone()
+
+                    cumulative_symbols = cumulative_symbols[~finished_sents]
+                    cumulative_probs = cumulative_probs[~finished_sents]
+                    max_lengths = max_lengths[~finished_sents]
+                    orig_idxs = orig_idxs[~finished_sents]
+                    cache.trim_finished_sents(finished_sents)
+
+                if finished_sents.all():
+                    break
+
+            # compute next token probabilities
+            last_symbols = cumulative_symbols[:, -1] # [size]
+            next_token_probs = decoder_one_step_fn(last_symbols.unsqueeze(1), time_step, cache) # [size, V]
+            all_choices_cumulative_probs = cumulative_probs + next_token_probs # [size, 1] + [size, V] = [size, V]
+
+            # sample next token
+            chosen_idxs = torch.multinomial(torch.exp(next_token_probs), 1, replacement=True) # [size, 1]
+            cumulative_probs = torch.gather(all_choices_cumulative_probs, -1, chosen_idxs) # [size, 1]
+            cumulative_symbols = torch.cat((cumulative_symbols, chosen_idxs), -1)
+
+        # get the tensors into proper format for returning (this will be fixed later)
+        ret = [None] * batch_size
+        for j in range(batch_size):
+            ret_symbols_j = ret_symbols[j*num_samples:(j+1)*num_samples]
+            ret_probs_j = ret_probs[j*num_samples:(j+1)*num_samples]
+
+            ret_symbols_j_cat = pad_sequence(ret_symbols_j, batch_first=True, padding_value=ac.EOS_ID)
+            ret_probs_j_cat = torch.stack(ret_probs_j)
+
+            ret[j] = {
+                'symbols': ret_symbols_j_cat,
+                'probs': ret_probs_j_cat,
+                'scores': ret_probs_j_cat.clone()
+            }
+
+        return ret
+
     #def beam_search(self):
     
     #def MBR(self):
@@ -22,21 +86,24 @@ class Generator():
     # src: [batch_size, length]
     # logit_mask: ???
     # src_lang_idx, tgt_lang_idx, beam_size: int
+    # TODO(darcey): rename "beam_size" to something more general
     def generate(self, src, src_lang_idx, tgt_lang_idx, logit_mask, beam_size):
 
         if self.args.use_rel_max_len:
-            max_possible_length = src.size(1) + self.args.rel_max_len + 1
             max_lengths = torch.sum(src != ac.PAD_ID, dim=-1).type(src.type()) + self.args.rel_max_len
         else:
-            max_possible_length = max(self.args.abs_max_len + 1, src.size(1))  
             max_lengths = torch.tensor([self.args.abs_max_len] * src.size(0)).type(src.type())
+        max_possible_length = max_lengths.max().item()
             
         decoder_one_step_fn, cache = self.model.get_decoder_one_step_fn(src, src_lang_idx, tgt_lang_idx, logit_mask, max_possible_length)
         
+        decode_method = self.args.decode_method
+        if decode_method == ac.SAMPLING:
+            return self.sample(src, max_lengths, max_possible_length, decoder_one_step_fn, cache, beam_size)
+
         bos_id = ac.BOS_ID
         eos_id = ac.EOS_ID
         alpha = self.args.beam_alpha
-        decode_method = self.args.decode_method
         allow_empty = self.args.allow_empty
         
         # below this point is stuff I copied from the old beam_decode function in layers.py
@@ -63,14 +130,12 @@ class Generator():
         cache.expand_to_beam_size(beam_size)
 
         num_classes = next_token_probs.size(-1)
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        not_eos_mask = (torch.arange(num_classes, device=device).reshape(1, -1) != eos_id)
-        maximum_length = max_lengths.max().item()
+        not_eos_mask = (torch.arange(num_classes, device=self.device).reshape(1, -1) != eos_id)
         ret = [None] * batch_size
         batch_idxs = torch.arange(batch_size)
-        for time_step in range(1, maximum_length + 1):
+        for time_step in range(1, max_possible_length + 1):
             # once all the beams/samples for a sentence are finished, can stop doing computations on it
-            surpass_length = (max_lengths < time_step) + (time_step == maximum_length)
+            surpass_length = (max_lengths < time_step) + (time_step == max_possible_length)
             finished_decoded = torch.sum((cumulative_symbols[:, :, -1] == eos_id).type(max_lengths.type()), -1) == beam_size
             finished_sents = surpass_length + finished_decoded
             if finished_sents.any():
@@ -141,7 +206,7 @@ class Generator():
                 if finished_mask.any():
                     next_token_probs[finished_mask][:, :] = float('-inf')
                     next_token_probs[finished_mask][:, eos_id] = 0
-                idxs = torch.multinomial(torch.exp(next_token_probs), 1) # [bsz x beam, 1]
+                idxs = torch.multinomial(torch.exp(next_token_probs), 1, replacement=True) # [bsz x beam, 1]
 
                 cumulative_probs = torch.gather(beam_probs, -1, idxs) # [bsz x beam, 1]
                 cumulative_scores = torch.gather(beam_scores, -1, idxs) # [bsz x beam, 1]
