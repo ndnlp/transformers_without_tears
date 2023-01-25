@@ -357,6 +357,23 @@ class Decoder(nn.Module):
             mask = self.cache['encoder_mask']
             return k, v, mask
 
+        # Expand sample size from 1 to sample_size
+        def expand_to_sample_size(self, sample_size):
+            if not self.in_batch_comma_beam_format:
+                self.batch_comma_beam()
+            new_batch_size = self.batch_size * sample_size
+            self.cache['encoder_mask'] = self.cache['encoder_mask'].expand(-1, sample_size, -1, -1, -1).reshape(new_batch_size, 1, 1, 1, -1)
+            for i in range(self.num_layers):
+                seq_len = self.cache[i]['cross_att_k'].size(2)
+                self.cache[i]['cross_att_k'] = self.cache[i]['cross_att_k'].expand(-1, sample_size, -1, -1).reshape(new_batch_size, 1, seq_len, -1)
+                self.cache[i]['cross_att_v'] = self.cache[i]['cross_att_v'].expand(-1, sample_size, -1, -1).reshape(new_batch_size, 1, seq_len, -1)
+
+                if self.cache[i]['att']['k'] is not None:
+                    seq_len = self.cache[i]['att']['k'].size(2)
+                    self.cache[i]['att']['k'] = self.cache[i]['att']['k'].expand(-1, sample_size, -1, -1).reshape(new_batch_size, 1, seq_len, -1)
+                    self.cache[i]['att']['v'] = self.cache[i]['att']['v'].expand(-1, sample_size, -1, -1).reshape(new_batch_size, 1, seq_len, -1)
+            self.batch_size = new_batch_size
+
         # Expand beam size from 1 to beam_size
         def expand_to_beam_size(self, beam_size):
             if not self.in_batch_comma_beam_format:
